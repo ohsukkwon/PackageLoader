@@ -8,6 +8,11 @@ from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
 
+g_FONT_FACE = "Malgun Gothic"
+g_FONT_SIZE = 10
+g_FONT_10_normal_ref = QFont(g_FONT_FACE, g_FONT_SIZE)
+g_FONT_10_bold_ref = QFont(g_FONT_FACE, g_FONT_SIZE, QFont.Bold)
+
 
 class PackageWorker(QThread):
     """패키지 정보를 가져오는 워커 스레드"""
@@ -69,6 +74,226 @@ class PackageWorker(QThread):
             self.error_occurred.emit(f"오류가 발생했습니다: {str(e)}")
 
 
+class PackageOperationWorker(QThread):
+    """패키지 작업을 처리하는 워커 스레드"""
+    progress_updated = pyqtSignal(int, str)  # 진행률, 현재 처리중인 패키지명
+    operation_completed = pyqtSignal(list)  # 실패한 패키지 목록
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, device_id, packages, operation):
+        super().__init__()
+        self.device_id = device_id
+        self.packages = packages
+        self.operation = operation
+        self._is_cancelled = False
+
+    def run(self):
+        failed_packages = []
+        total_packages = len(self.packages)
+
+        for i, package in enumerate(self.packages):
+            if self._is_cancelled:
+                break
+
+            try:
+                # 진행 상황 업데이트
+                progress = int((i / total_packages) * 100)
+                self.progress_updated.emit(progress, package)
+
+                if self.operation == "uninstall":
+                    cmd = f"adb -s {self.device_id} uninstall {package}"
+                elif self.operation == "disable":
+                    cmd = f"adb -s {self.device_id} shell pm disable-user {package}"
+                elif self.operation == "enable":
+                    cmd = f"adb -s {self.device_id} shell pm enable {package}"
+                elif self.operation == "reset":
+                    cmd = f"adb -s {self.device_id} shell pm default-state {package}"
+
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+
+                if result.returncode != 0 or (self.operation == "uninstall" and "Failure" in result.stdout):
+                    failed_packages.append(package)
+
+            except Exception as e:
+                failed_packages.append(package)
+
+        # 작업 완료
+        self.progress_updated.emit(100, "완료")
+        self.operation_completed.emit(failed_packages)
+
+    def cancel(self):
+        """작업 취소"""
+        self._is_cancelled = True
+
+
+class ProgressDialog(QDialog):
+    """패키지 작업 진행 상황을 표시하는 다이얼로그"""
+    cancel_requested = pyqtSignal()
+
+    def __init__(self, operation, total_packages, parent=None):
+        super().__init__(parent)
+        self.operation = operation
+        self.total_packages = total_packages
+        self.init_ui()
+
+    def init_ui(self):
+        operation_names = {
+            "uninstall": "삭제",
+            "disable": "비활성화",
+            "enable": "활성화",
+            "reset": "재설정"
+        }
+
+        self.setWindowTitle(f"패키지 {operation_names.get(self.operation, '처리')}")
+        self.setModal(True)
+        self.setFixedSize(500, 300)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # 제목
+        title_label = QLabel(f"📦 패키지 {operation_names.get(self.operation, '처리')} 진행 중")
+        title_label.setFont(g_FONT_10_bold_ref)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #2c3e50; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+
+        # 현재 처리중인 패키지
+        self.current_package_label = QLabel("준비 중...")
+        self.current_package_label.setFont(g_FONT_10_normal_ref)
+        self.current_package_label.setAlignment(Qt.AlignCenter)
+        self.current_package_label.setStyleSheet("""
+            color: #34495e; 
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 8px;
+            margin: 5px;
+        """)
+        layout.addWidget(self.current_package_label)
+
+        # 진행률 표시
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #bdc3c7;
+                border-radius: 8px;
+                text-align: center;
+                font-weight: bold;
+                background-color: #ecf0f1;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #3498db, stop:1 #2980b9);
+                border-radius: 7px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        # 진행 상태 라벨
+        self.status_label = QLabel(f"0 / {self.total_packages} 완료")
+        self.status_label.setFont(g_FONT_10_normal_ref)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("color: #7f8c8d;")
+        layout.addWidget(self.status_label)
+
+        # 취소 버튼
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        self.cancel_button = QPushButton("취소")
+        self.cancel_button.setFont(g_FONT_10_bold_ref)
+        self.cancel_button.setFixedSize(100, 35)
+        self.cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #c0392b;
+            }
+            QPushButton:pressed {
+                background-color: #a93226;
+            }
+        """)
+        self.cancel_button.clicked.connect(self.on_cancel_clicked)
+        button_layout.addWidget(self.cancel_button)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    @pyqtSlot(int, str)
+    def update_progress(self, progress, current_package):
+        """진행 상황 업데이트"""
+        self.progress_bar.setValue(progress)
+
+        if current_package == "완료":
+            self.current_package_label.setText("✅ 작업이 완료되었습니다!")
+            self.current_package_label.setStyleSheet("""
+                color: #27ae60; 
+                background-color: #d5f4e6;
+                border: 1px solid #27ae60;
+                border-radius: 4px;
+                padding: 8px;
+                margin: 5px;
+                font-weight: bold;
+            """)
+            self.cancel_button.setText("✅ 완료")
+            self.cancel_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #27ae60;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px 16px;
+                }
+                QPushButton:hover {
+                    background-color: #229954;
+                }
+            """)
+        else:
+            self.current_package_label.setText(f"처리 중: {current_package}")
+
+        # 완료된 패키지 수 계산
+        completed = int((progress / 100) * self.total_packages)
+        self.status_label.setText(f"{completed} / {self.total_packages} 완료")
+
+    def on_cancel_clicked(self):
+        """취소 버튼 클릭"""
+        if self.cancel_button.text() == "✅ 완료":
+            self.accept()
+        else:
+            reply = QMessageBox.question(self, "확인",
+                                         "작업을 취소하시겠습니까?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.cancel_requested.emit()
+                self.reject()
+
+    def closeEvent(self, event):
+        """윈도우 닫기 이벤트"""
+        if self.cancel_button.text() != "✅ 완료":
+            reply = QMessageBox.question(self, "확인",
+                                         "작업을 취소하시겠습니까?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.cancel_requested.emit()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+
 class PackageDetailDialog(QDialog):
     """패키지 상세 정보를 표시하는 서브 윈도우 (이쁘게 구성)"""
 
@@ -113,13 +338,13 @@ class PackageDetailDialog(QDialog):
         title_layout = QVBoxLayout(title_frame)
 
         title_label = QLabel("📦 패키지 상세 정보")
-        title_label.setFont(QFont("", 11, QFont.Bold))
+        title_label.setFont(g_FONT_10_bold_ref)
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setStyleSheet("color: #2c3e50; background: transparent; border: none;")
         title_layout.addWidget(title_label)
 
         package_label = QLabel(f"Package: {self.package_name}")
-        package_label.setFont(QFont("", 11))
+        package_label.setFont(g_FONT_10_normal_ref)
         package_label.setAlignment(Qt.AlignCenter)
         package_label.setStyleSheet("color: #34495e; background: transparent; border: none; margin-top: 5px;")
         title_layout.addWidget(package_label)
@@ -148,8 +373,8 @@ class PackageDetailDialog(QDialog):
         info_layout = QVBoxLayout(info_frame)
 
         # 로딩 라벨
-        self.loading_label = QLabel("📥 패키지 정보를 로드하는 중...")
-        self.loading_label.setFont(QFont("", 12))
+        self.loading_label = QLabel("📥 패키지 정보를 로드")
+        self.loading_label.setFont(g_FONT_10_normal_ref)
         self.loading_label.setAlignment(Qt.AlignCenter)
         self.loading_label.setStyleSheet("color: #3498db; padding: 20px;")
         info_layout.addWidget(self.loading_label)
@@ -163,12 +388,12 @@ class PackageDetailDialog(QDialog):
         # 스타일 설정을 위한 함수
         def create_info_field(label_text, icon=""):
             label = QLabel(f"{icon} {label_text}")
-            label.setFont(QFont("", 11, QFont.Bold))
+            label.setFont(g_FONT_10_bold_ref)
             label.setStyleSheet("color: #2c3e50; min-width: 150px;")
 
             edit = QLineEdit()
             edit.setReadOnly(True)
-            edit.setFont(QFont("Consolas", 9))
+            edit.setFont(g_FONT_10_normal_ref)
             edit.setStyleSheet("""
                 QLineEdit {
                     background-color: #f8f9fa;
@@ -227,7 +452,7 @@ class PackageDetailDialog(QDialog):
 
         # 복사 버튼
         self.copy_button = QPushButton("📋 복사")
-        self.copy_button.setFont(QFont("", 10, QFont.Bold))
+        self.copy_button.setFont(g_FONT_10_bold_ref)
         self.copy_button.setFixedSize(100, 35)
         self.copy_button.setStyleSheet("""
             QPushButton {
@@ -256,7 +481,7 @@ class PackageDetailDialog(QDialog):
 
         # 닫기 버튼
         close_button = QPushButton("❌ 닫기")
-        close_button.setFont(QFont("", 10, QFont.Bold))
+        close_button.setFont(g_FONT_10_bold_ref)
         close_button.setFixedSize(100, 35)
         close_button.setStyleSheet("""
             QPushButton {
@@ -436,13 +661,13 @@ class PackageInfoDialog(QDialog):
 
         # 패키지명 라벨
         title_label = QLabel(f"패키지: {self.package_name}")
-        title_label.setFont(QFont("", 11, QFont.Bold))
+        title_label.setFont(g_FONT_10_bold_ref)
         layout.addWidget(title_label)
 
         # 텍스트 에디터 (읽기 전용)
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
-        self.text_edit.setFont(QFont("Consolas", 9))
+        self.text_edit.setFont(g_FONT_10_normal_ref)
 
         # 스크롤바 항상 표시
         self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
@@ -468,7 +693,7 @@ class PackageInfoDialog(QDialog):
 
     def load_package_info(self):
         """패키지 정보 로드"""
-        self.text_edit.setText("패키지 정보를 로드하는 중...")
+        self.text_edit.setText("패키지 정보를 로드")
 
         # 백그라운드에서 정보 로드
         self.worker = QThread()
@@ -547,12 +772,8 @@ class CheckBoxTableWidget(QTableWidget):
                         # 첫 번째 체크박스의 반대 상태로 모든 선택된 행을 설정
                         new_state = not first_checkbox.isChecked()
 
-                        for row in selected_rows:
-                            checkbox_widget = self.cellWidget(row, 1)
-                            if checkbox_widget:
-                                checkbox = checkbox_widget.findChild(QCheckBox)
-                                if checkbox:
-                                    checkbox.setChecked(new_state)
+                        # 이벤트 연결을 임시로 해제하고 일괄 업데이트
+                        self.batch_update_checkboxes(selected_rows, new_state)
             return
         elif event.key() == Qt.Key_C and event.modifiers() == Qt.ControlModifier:
             # Ctrl+C 처리: 선택된 모든 행의 패키지 이름 복사
@@ -588,6 +809,37 @@ class CheckBoxTableWidget(QTableWidget):
             return
 
         super().keyPressEvent(event)
+
+    def batch_update_checkboxes(self, row_indices, new_state):
+        """여러 체크박스를 일괄 업데이트하는 최적화된 메서드"""
+        # 부모 위젯에서 일괄 업데이트 시작 알림
+        parent_widget = self.parent()
+        while parent_widget:
+            if hasattr(parent_widget, 'start_batch_update'):
+                parent_widget.start_batch_update()
+                break
+            parent_widget = parent_widget.parent()
+
+        try:
+            # 체크박스 상태를 빠르게 업데이트
+            for row in row_indices:
+                checkbox_widget = self.cellWidget(row, 1)
+                if checkbox_widget:
+                    checkbox = checkbox_widget.findChild(QCheckBox)
+                    if checkbox:
+                        # 이벤트 차단하고 상태만 변경
+                        checkbox.blockSignals(True)
+                        checkbox.setChecked(new_state)
+                        checkbox.blockSignals(False)
+
+        finally:
+            # 일괄 업데이트 완료 알림
+            parent_widget = self.parent()
+            while parent_widget:
+                if hasattr(parent_widget, 'end_batch_update'):
+                    parent_widget.end_batch_update(row_indices, new_state)
+                    break
+                parent_widget = parent_widget.parent()
 
     def sort(self, column, order):
         """정렬 - Package Name 컬럼(2)만 허용하고 패키지 이름으로만 정렬"""
@@ -640,6 +892,17 @@ class PackageListWidget(QWidget):
         self.search_results = []
         self.current_search_index = -1
         self.current_device_id = None
+        # 성능 향상을 위한 패키지 딕셔너리 (이름을 키로 사용)
+        self.package_dict = {}
+        # 일괄 업데이트 상태
+        self.is_batch_updating = False
+        # 진행 상황 다이얼로그
+        self.progress_dialog = None
+        self.operation_worker = None
+        # 스크롤바 위치 및 선택된 항목 저장
+        self.saved_scroll_position = 0
+        self.saved_selected_packages = []
+        self.saved_current_row = -1
         self.init_ui()
 
     def init_ui(self):
@@ -671,7 +934,7 @@ class PackageListWidget(QWidget):
 
         # 전체 패키지 갯수 표시 라벨
         self.package_count_label = QLabel("전체 package 갯수 [0]")
-        self.package_count_label.setFont(QFont("", 10, QFont.Bold))
+        self.package_count_label.setFont(g_FONT_10_bold_ref)
         layout.addWidget(self.package_count_label)
 
         # 패키지 테이블 (체크박스 테이블 사용) - 인덱스 컬럼 추가
@@ -685,7 +948,9 @@ class PackageListWidget(QWidget):
         header.setSectionResizeMode(1, QHeaderView.Interactive)  # 체크박스 컬럼
         header.setSectionResizeMode(2, QHeaderView.Interactive)  # Package Name 컬럼
         header.setSortIndicatorShown(True)  # 정렬 표시 활성화
-        header.sortIndicatorChanged.connect(self.on_sort_indicator_changed)
+        # 수정된 부분: 메서드 존재 여부를 확인하고 연결
+        if hasattr(self, 'on_sort_indicator_changed'):
+            header.sortIndicatorChanged.connect(self.on_sort_indicator_changed)
         self.package_table.setSortingEnabled(True)
 
         # 마우스 이벤트 연결 (더블클릭)
@@ -742,7 +1007,67 @@ class PackageListWidget(QWidget):
 
         layout.addWidget(self.package_table)
 
-        # 버튼 레이아웃
+        # 새로운 체크박스 제어 버튼 레이아웃
+        checkbox_control_layout = QHBoxLayout()
+
+        # CheckOn 버튼 추가
+        self.check_on_button = QPushButton("Check On")
+        self.check_on_button.clicked.connect(self.check_on_selected)
+        self.check_on_button.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+        """)
+        checkbox_control_layout.addWidget(self.check_on_button)
+
+        # CheckOff 버튼 추가
+        self.check_off_button = QPushButton("Check Off")
+        self.check_off_button.clicked.connect(self.check_off_selected)
+        self.check_off_button.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        checkbox_control_layout.addWidget(self.check_off_button)
+
+        # Toggle 버튼 추가
+        self.toggle_button = QPushButton("Toggle")
+        self.toggle_button.clicked.connect(self.toggle_selected)
+        self.toggle_button.setStyleSheet("""
+            QPushButton {
+                background-color: #007bff;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+        """)
+        checkbox_control_layout.addWidget(self.toggle_button)
+
+        checkbox_control_layout.addStretch()
+        layout.addLayout(checkbox_control_layout)
+
+        # 기존 버튼 레이아웃
         button_layout = QHBoxLayout()
 
         # Uninstall 버튼
@@ -760,8 +1085,8 @@ class PackageListWidget(QWidget):
         self.enable_button.clicked.connect(self.enable_selected)
         button_layout.addWidget(self.enable_button)
 
-        # Reset 버튼
-        self.reset_button = QPushButton("Reset")
+        # Reset 버튼 (Default로 변경)
+        self.reset_button = QPushButton("Default")
         self.reset_button.clicked.connect(self.reset_selected)
         button_layout.addWidget(self.reset_button)
 
@@ -783,8 +1108,150 @@ class PackageListWidget(QWidget):
             header = self.package_table.horizontalHeader()
             header.setSortIndicator(2, Qt.AscendingOrder)
 
+    def save_scroll_position(self):
+        """현재 스크롤바 위치를 저장"""
+        scroll_bar = self.package_table.verticalScrollBar()
+        self.saved_scroll_position = scroll_bar.value()
+
+    def restore_scroll_position(self):
+        """저장된 스크롤바 위치로 복원"""
+        scroll_bar = self.package_table.verticalScrollBar()
+        scroll_bar.setValue(self.saved_scroll_position)
+
+    def save_selected_items(self):
+        """현재 선택된 항목들과 포커스 행을 저장"""
+        # 현재 선택된 패키지 이름들 저장
+        self.saved_selected_packages = []
+        selected_indexes = self.package_table.selectionModel().selectedIndexes()
+        selected_rows = set()
+
+        for index in selected_indexes:
+            selected_rows.add(index.row())
+
+        for row in selected_rows:
+            package_name_item = self.package_table.item(row, 2)
+            if package_name_item:
+                self.saved_selected_packages.append(package_name_item.text())
+
+        # 현재 포커스된 행의 패키지 이름 저장
+        current_row = self.package_table.currentRow()
+        if current_row >= 0:
+            package_name_item = self.package_table.item(current_row, 2)
+            if package_name_item:
+                self.saved_current_row = package_name_item.text()
+            else:
+                self.saved_current_row = None
+        else:
+            self.saved_current_row = None
+
+    def restore_selected_items(self):
+        """저장된 선택 항목들과 포커스 행을 복원"""
+        if not self.saved_selected_packages and self.saved_current_row is None:
+            return
+
+        # 패키지 이름으로 행 찾기를 위한 딕셔너리 생성
+        package_to_row = {}
+        for row in range(self.package_table.rowCount()):
+            package_name_item = self.package_table.item(row, 2)
+            if package_name_item:
+                package_to_row[package_name_item.text()] = row
+
+        # 선택 상태를 클리어하고 새로 설정
+        self.package_table.clearSelection()
+
+        # 저장된 선택 항목들을 복원
+        for package_name in self.saved_selected_packages:
+            if package_name in package_to_row:
+                row = package_to_row[package_name]
+                self.package_table.selectRow(row)
+
+        # 저장된 포커스 행을 복원
+        if self.saved_current_row and self.saved_current_row in package_to_row:
+            row = package_to_row[self.saved_current_row]
+            self.package_table.setCurrentCell(row, 2)
+
+    def check_on_selected(self):
+        """선택된 패키지들의 체크박스를 모두 CheckOn"""
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.information(self, "알림", "CheckOn할 패키지를 선택해주세요.")
+            return
+
+        self.batch_update_selected_checkboxes(selected_rows, True)
+
+    def check_off_selected(self):
+        """선택된 패키지들의 체크박스를 모두 CheckOff"""
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.information(self, "알림", "CheckOff할 패키지를 선택해주세요.")
+            return
+
+        self.batch_update_selected_checkboxes(selected_rows, False)
+
+    def toggle_selected(self):
+        """선택된 패키지들의 체크박스를 토글"""
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.information(self, "알림", "토글할 패키지를 선택해주세요.")
+            return
+
+        # 첫 번째 선택된 행의 체크박스 상태를 기준으로 토글
+        first_row = min(selected_rows)
+        first_checkbox_widget = self.package_table.cellWidget(first_row, 1)
+        if first_checkbox_widget:
+            first_checkbox = first_checkbox_widget.findChild(QCheckBox)
+            if first_checkbox:
+                # 첫 번째 체크박스의 반대 상태로 모든 선택된 행을 설정
+                new_state = not first_checkbox.isChecked()
+                self.batch_update_selected_checkboxes(selected_rows, new_state)
+
+    def get_selected_rows(self):
+        """선택된 행들의 인덱스 리스트 반환"""
+        selected_rows = set()
+        selected_indexes = self.package_table.selectionModel().selectedIndexes()
+        for index in selected_indexes:
+            selected_rows.add(index.row())
+        return sorted(list(selected_rows))
+
+    def batch_update_selected_checkboxes(self, row_indices, new_state):
+        """선택된 행들의 체크박스를 일괄 업데이트"""
+        self.start_batch_update()
+        try:
+            for row in row_indices:
+                checkbox_widget = self.package_table.cellWidget(row, 1)
+                if checkbox_widget:
+                    checkbox = checkbox_widget.findChild(QCheckBox)
+                    if checkbox:
+                        checkbox.blockSignals(True)
+                        checkbox.setChecked(new_state)
+                        checkbox.blockSignals(False)
+        finally:
+            self.end_batch_update(row_indices, new_state)
+
+    def start_batch_update(self):
+        """일괄 업데이트 시작"""
+        self.is_batch_updating = True
+
+    def end_batch_update(self, row_indices, new_state):
+        """일괄 업데이트 완료 - 패키지 데이터 업데이트"""
+        try:
+            # 효율적으로 패키지 데이터 업데이트
+            for row in row_indices:
+                package_name_item = self.package_table.item(row, 2)
+                if package_name_item:
+                    package_name = package_name_item.text()
+                    # 딕셔너리를 사용한 빠른 검색
+                    if package_name in self.package_dict:
+                        self.package_dict[package_name]['selected'] = new_state
+        finally:
+            self.is_batch_updating = False
+
     def on_checkbox_changed(self, state):
-        """개별 체크박스 상태 변경"""
+        """개별 체크박스 상태 변경 - 최적화됨"""
+        # 일괄 업데이트 중이면 개별 처리 건너뛰기
+        if self.is_batch_updating:
+            return
+
         checkbox = self.sender()
         row = -1
 
@@ -800,14 +1267,14 @@ class PackageListWidget(QWidget):
             package_name_item = self.package_table.item(row, 2)
             if package_name_item:
                 package_name = package_name_item.text()
-                for package in self.filtered_packages:
-                    if package['name'] == package_name:
-                        package['selected'] = (state == Qt.Checked)
+                # 딕셔너리를 사용한 빠른 업데이트
+                if package_name in self.package_dict:
+                    package = self.package_dict[package_name]
+                    package['selected'] = (state == Qt.Checked)
 
-                        # 체크박스 상태에 따라 작업 수행
-                        if state == Qt.Checked:
-                            self.install_or_enable_package(package_name, package['is_system'])
-                        break
+                    # 체크박스 상태에 따라 작업 수행
+                    if state == Qt.Checked:
+                        self.install_or_enable_package(package_name, package['is_system'])
 
     def install_or_enable_package(self, package_name, is_system):
         """패키지 설치 또는 활성화"""
@@ -1025,11 +1492,18 @@ class PackageListWidget(QWidget):
 
     @pyqtSlot(list)
     def on_packages_loaded(self, packages):
-        """패키지 로드 완료"""
+        """패키지 로드 완료 - 최적화됨"""
         self.packages = packages
         self.filtered_packages = packages.copy()
+
+        # 패키지 딕셔너리 생성 (빠른 검색을 위해)
+        self.package_dict = {pkg['name']: pkg for pkg in packages}
+
         self.display_packages()
         self.progress_bar.setVisible(False)
+
+        # 패키지 목록 로드 후 선택된 항목들 복원
+        QTimer.singleShot(100, self.restore_selected_items)
 
     @pyqtSlot(str)
     def on_error(self, error_message):
@@ -1038,46 +1512,53 @@ class PackageListWidget(QWidget):
         self.progress_bar.setVisible(False)
 
     def display_packages(self):
-        """패키지 목록 표시"""
+        """패키지 목록 표시 - 최적화됨"""
         self.package_table.setRowCount(len(self.filtered_packages))
 
         # 전체 패키지 갯수 표시 업데이트
         self.package_count_label.setText(f"전체 package 갯수 [{len(self.filtered_packages)}]")
 
-        for row, package in enumerate(self.filtered_packages):
-            # Index 컬럼 (정렬 불가)
-            index_item = QTableWidgetItem(str(row + 1))
-            index_item.setFlags(index_item.flags() & ~Qt.ItemIsEditable)
-            index_item.setTextAlignment(Qt.AlignCenter)
-            self.package_table.setItem(row, 0, index_item)
+        # 업데이트 시작을 알림
+        self.package_table.setUpdatesEnabled(False)  # UI 업데이트 임시 중단
 
-            # 체크박스
-            checkbox = QCheckBox()
-            checkbox.setChecked(package.get('selected', False))
-            checkbox.stateChanged.connect(self.on_checkbox_changed)
-            # 시스템 앱은 회색으로 표시
-            if package['is_system']:
-                checkbox.setStyleSheet("color: gray;")
+        try:
+            for row, package in enumerate(self.filtered_packages):
+                # Index 컬럼 (정렬 불가)
+                index_item = QTableWidgetItem(str(row + 1))
+                index_item.setFlags(index_item.flags() & ~Qt.ItemIsEditable)
+                index_item.setTextAlignment(Qt.AlignCenter)
+                self.package_table.setItem(row, 0, index_item)
 
-            # 체크박스를 가운데 정렬
-            checkbox_widget = QWidget()
-            checkbox_layout = QHBoxLayout(checkbox_widget)
-            checkbox_layout.addWidget(checkbox)
-            checkbox_layout.setAlignment(Qt.AlignCenter)
-            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+                # 체크박스
+                checkbox = QCheckBox()
+                checkbox.setChecked(package.get('selected', False))
+                checkbox.stateChanged.connect(self.on_checkbox_changed)
+                # 시스템 앱은 회색으로 표시
+                if package['is_system']:
+                    checkbox.setStyleSheet("color: gray;")
 
-            self.package_table.setCellWidget(row, 1, checkbox_widget)
+                # 체크박스를 가운데 정렬
+                checkbox_widget = QWidget()
+                checkbox_layout = QHBoxLayout(checkbox_widget)
+                checkbox_layout.addWidget(checkbox)
+                checkbox_layout.setAlignment(Qt.AlignCenter)
+                checkbox_layout.setContentsMargins(0, 0, 0, 0)
 
-            # Package Name
-            name_item = QTableWidgetItem(package['name'])
-            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
-            if package['is_system']:
-                name_item.setForeground(QColor('gray'))
-            else:
-                name_item.setForeground(QColor('black'))
-            # 배경색을 명시적으로 설정
-            name_item.setBackground(QColor(255, 255, 255))  # 흰색 배경
-            self.package_table.setItem(row, 2, name_item)
+                self.package_table.setCellWidget(row, 1, checkbox_widget)
+
+                # Package Name
+                name_item = QTableWidgetItem(package['name'])
+                name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+                if package['is_system']:
+                    name_item.setForeground(QColor('gray'))
+                else:
+                    name_item.setForeground(QColor('black'))
+                # 배경색을 명시적으로 설정
+                name_item.setBackground(QColor(255, 255, 255))  # 흰색 배경
+                self.package_table.setItem(row, 2, name_item)
+
+        finally:
+            self.package_table.setUpdatesEnabled(True)  # UI 업데이트 재개
 
     def get_selected_packages(self):
         """선택된 패키지 목록 반환"""
@@ -1107,6 +1588,8 @@ class PackageListWidget(QWidget):
                                      QMessageBox.Yes | QMessageBox.No)
 
         if reply == QMessageBox.Yes:
+            # 스크롤 위치 저장 (uninstall은 스크롤바만 저장)
+            self.save_scroll_position()
             self.perform_package_operation(selected_packages, "uninstall")
 
     def disable_selected(self):
@@ -1122,6 +1605,9 @@ class PackageListWidget(QWidget):
                                      QMessageBox.Yes | QMessageBox.No)
 
         if reply == QMessageBox.Yes:
+            # 스크롤 위치 및 선택 항목 저장
+            self.save_scroll_position()
+            self.save_selected_items()
             self.perform_package_operation(selected_packages, "disable")
 
     def enable_selected(self):
@@ -1137,6 +1623,9 @@ class PackageListWidget(QWidget):
                                      QMessageBox.Yes | QMessageBox.No)
 
         if reply == QMessageBox.Yes:
+            # 스크롤 위치 및 선택 항목 저장
+            self.save_scroll_position()
+            self.save_selected_items()
             self.perform_package_operation(selected_packages, "enable")
 
     def reset_selected(self):
@@ -1152,35 +1641,38 @@ class PackageListWidget(QWidget):
                                      QMessageBox.Yes | QMessageBox.No)
 
         if reply == QMessageBox.Yes:
+            # 스크롤 위치 및 선택 항목 저장
+            self.save_scroll_position()
+            self.save_selected_items()
             self.perform_package_operation(selected_packages, "reset")
 
     def perform_package_operation(self, packages, operation):
-        """패키지 작업 실행"""
+        """패키지 작업 실행 - 진행 다이얼로그와 함께"""
         if not self.current_device_id:
             QMessageBox.warning(self, "경고", "선택된 디바이스가 없습니다.")
             return
 
-        failed_packages = []
+        # 진행 다이얼로그 생성
+        self.progress_dialog = ProgressDialog(operation, len(packages), self)
 
-        for package in packages:
-            try:
-                if operation == "uninstall":
-                    cmd = f"adb -s {self.current_device_id} uninstall {package}"
-                elif operation == "disable":
-                    cmd = f"adb -s {self.current_device_id} shell pm disable-user {package}"
-                elif operation == "enable":
-                    cmd = f"adb -s {self.current_device_id} shell pm enable {package}"
-                elif operation == "reset":
-                    cmd = f"adb -s {self.current_device_id} shell pm default-state {package}"
+        # 워커 스레드 생성
+        self.operation_worker = PackageOperationWorker(self.current_device_id, packages, operation)
 
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        # 시그널 연결
+        self.operation_worker.progress_updated.connect(self.progress_dialog.update_progress)
+        self.operation_worker.operation_completed.connect(self.on_operation_completed)
+        self.operation_worker.error_occurred.connect(self.on_operation_error)
+        self.progress_dialog.cancel_requested.connect(self.operation_worker.cancel)
 
-                if result.returncode != 0 or (operation == "uninstall" and "Failure" in result.stdout):
-                    failed_packages.append(package)
+        # 워커 스레드 시작
+        self.operation_worker.start()
 
-            except Exception as e:
-                failed_packages.append(package)
+        # 진행 다이얼로그 표시
+        self.progress_dialog.exec_()
 
+    @pyqtSlot(list)
+    def on_operation_completed(self, failed_packages):
+        """패키지 작업 완료"""
         operation_names = {
             "uninstall": "삭제",
             "disable": "비활성화",
@@ -1188,20 +1680,46 @@ class PackageListWidget(QWidget):
             "reset": "재설정"
         }
 
+        # 결과 메시지 표시
         if failed_packages:
+            operation_name = operation_names.get(self.operation_worker.operation, "처리")
             QMessageBox.warning(self, "경고",
-                                f"다음 패키지 {operation_names[operation]}에 실패했습니다:\n" + "\n".join(failed_packages))
-        else:
-            QMessageBox.information(self, "완료", f"선택된 패키지가 모두 {operation_names[operation]}되었습니다.")
+                                f"다음 패키지 {operation_name}에 실패했습니다:\n" + "\n".join(failed_packages))
 
         # 패키지 목록 새로고침
         self.load_packages(self.current_device_id)
+
+        # 작업 완료 후 복원 처리
+        if self.operation_worker.operation == "uninstall":
+            # uninstall의 경우 스크롤 위치만 복원
+            QTimer.singleShot(1000, self.restore_scroll_position)
+        else:
+            # enable/disable/default의 경우 스크롤 위치와 선택 항목 모두 복원
+            QTimer.singleShot(1000, self.restore_scroll_position)
+            # 선택 항목 복원은 패키지 로드 완료 후에 처리됨 (on_packages_loaded에서)
+
+        # 정리
+        self.operation_worker = None
+        self.progress_dialog = None
+
+    @pyqtSlot(str)
+    def on_operation_error(self, error_message):
+        """패키지 작업 오류"""
+        if self.progress_dialog:
+            self.progress_dialog.accept()
+
+        QMessageBox.critical(self, "오류", f"작업 중 오류가 발생했습니다: {error_message}")
+
+        # 정리
+        self.operation_worker = None
+        self.progress_dialog = None
 
     def clear_packages(self):
         """패키지 목록 초기화"""
         self.package_table.setRowCount(0)
         self.packages = []
         self.filtered_packages = []
+        self.package_dict = {}  # 딕셔너리도 초기화
         self.search_results = []
         self.current_search_index = -1
         self.search_edit.clear()
@@ -1238,7 +1756,7 @@ class AndroidPackageManager(QMainWindow):
         # 상단: 디바이스 목록
         device_frame = QFrame()
         device_layout = QVBoxLayout()
-        device_layout.addWidget(QLabel("연결된 디바이스 목록 (더블클릭으로 선택)"))
+        device_layout.addWidget(QLabel("연결된 디바이스 목록 (더블클릭으로 선택 / F5로 연결된 단말 갱신)"))
 
         self.device_list = QListWidget()
         self.device_list.itemDoubleClicked.connect(self.on_device_selected)
@@ -1290,7 +1808,7 @@ class AndroidPackageManager(QMainWindow):
     def on_device_selected(self, item):
         """디바이스 선택 시 패키지 목록 로드"""
         device_id = item.text()
-        self.statusBar().showMessage(f"디바이스 {device_id}의 패키지 로드 중...")
+        self.statusBar().showMessage(f"디바이스 {device_id}의 패키지 로드")
 
         # 패키지 목록 로드
         self.package_widget.load_packages(device_id)
